@@ -29,7 +29,7 @@ type PubSub struct {
 	// messages we are publishing out to our peers
 	publish chan *Message
 
-	// addSub is a control channel for us to add and remove subscriptions
+	// control channel for adding new subscriptions
 	addSub chan *addSubReq
 
 	// get list of topics we are subscribed to
@@ -38,13 +38,13 @@ type PubSub struct {
 	// get chan of peers we are connected to
 	getPeers chan *listPeerReq
 
-	// send subscription here to cancel it
+	// control channel for canceling subscriptions
 	cancelCh chan *Subscription
 
-	// a notification channel for incoming streams from other peers
+	// a notification channel for new outbound streams to other peers
 	newPeers chan inet.Stream
 
-	// a notification channel for when our peers die
+	// a notification channel for when one of our outbound peers die
 	peerDead chan peer.ID
 
 	// The set of topics we are subscribed to
@@ -53,6 +53,7 @@ type PubSub struct {
 	// topics tracks which topics each of our peers are subscribed to
 	topics map[string]map[peer.ID]struct{}
 
+	// list of connected outbound peers
 	peers        map[peer.ID]chan *RPC
 	seenMessages *timecache.TimeCache
 
