@@ -2,12 +2,12 @@ package floodsub
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"time"
 
 	pb "github.com/libp2p/go-floodsub/pb"
 
+	cid "github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log"
 	host "github.com/libp2p/go-libp2p-host"
 	inet "github.com/libp2p/go-libp2p-net"
@@ -27,7 +27,7 @@ type PubSub struct {
 	incoming chan *RPC
 
 	// messages we are publishing out to our peers
-	publish chan *Message
+	publish chan *message
 
 	// control channel for adding new subscriptions
 	addSub chan *addSubReq
@@ -60,12 +60,9 @@ type PubSub struct {
 	ctx context.Context
 }
 
-type Message struct {
-	*pb.Message
-}
-
-func (m *Message) GetFrom() peer.ID {
-	return peer.ID(m.Message.GetFrom())
+type message struct {
+	topics  []*cid.Cid
+	message *cid.Cid
 }
 
 type RPC struct {
@@ -81,7 +78,7 @@ func NewFloodSub(ctx context.Context, h host.Host) *PubSub {
 		host:         h,
 		ctx:          ctx,
 		incoming:     make(chan *RPC, 32),
-		publish:      make(chan *Message),
+		publish:      make(chan *message),
 		newPeers:     make(chan inet.Stream),
 		peerDead:     make(chan peer.ID),
 		cancelCh:     make(chan *Subscription),
@@ -131,9 +128,15 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				delete(t, pid)
 			}
 		case treq := <-p.getTopics:
-			var out []string
+			var out []*cid.Cid
 			for t := range p.myTopics {
-				out = append(out, t)
+				// TODO: We shouldn't have to parse this. We
+				// should store the *actual* Cids here.
+				c, err := cid.Cast([]byte(t))
+				if err != nil {
+					panic("failed to parse a known-valid CID.")
+				}
+				out = append(out, c)
 			}
 			treq.resp <- out
 		case sub := <-p.cancelCh:
@@ -164,7 +167,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				continue
 			}
 		case msg := <-p.publish:
-			p.maybePublishMessage(p.host.ID(), msg.Message)
+			p.maybePublishMessage(p.host.ID(), msg)
 		case <-ctx.Done():
 			log.Info("pubsub processloop shutting down")
 			return
@@ -177,7 +180,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 // that this node is not subscribing to this topic anymore.
 // Only called from processLoop.
 func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
-	subs := p.myTopics[sub.topic]
+	subs := p.myTopics[sub.topicId]
 
 	if subs == nil {
 		return
@@ -188,8 +191,8 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 	delete(subs, sub)
 
 	if len(subs) == 0 {
-		delete(p.myTopics, sub.topic)
-		p.announce(sub.topic, false)
+		delete(p.myTopics, sub.topicId)
+		p.announce(sub.topicId, false)
 	}
 }
 
@@ -198,35 +201,37 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 // subscribes to the topic.
 // Only called from processLoop.
 func (p *PubSub) handleAddSubscription(req *addSubReq) {
-	subs := p.myTopics[req.topic]
+	topicId := string(req.topic.Bytes())
+	subs := p.myTopics[topicId]
 
 	// announce we want this topic
 	if len(subs) == 0 {
-		p.announce(req.topic, true)
+		p.announce(topicId, true)
 	}
 
 	// make new if not there
 	if subs == nil {
-		p.myTopics[req.topic] = make(map[*Subscription]struct{})
-		subs = p.myTopics[req.topic]
+		p.myTopics[topicId] = make(map[*Subscription]struct{})
+		subs = p.myTopics[topicId]
 	}
 
 	sub := &Subscription{
-		ch:       make(chan *Message, 32),
+		ch:       make(chan *cid.Cid, 32),
+		topicId:  topicId,
 		topic:    req.topic,
 		cancelCh: p.cancelCh,
 	}
 
-	p.myTopics[sub.topic][sub] = struct{}{}
+	p.myTopics[sub.topicId][sub] = struct{}{}
 
 	req.resp <- sub
 }
 
 // announce announces whether or not this node is interested in a given topic
 // Only called from processLoop.
-func (p *PubSub) announce(topic string, sub bool) {
+func (p *PubSub) announce(topicId string, sub bool) {
 	subopt := &pb.RPC_SubOpts{
-		Topicid:   &topic,
+		Topicid:   []byte(topicId),
 		Subscribe: &sub,
 	}
 
@@ -238,11 +243,11 @@ func (p *PubSub) announce(topic string, sub bool) {
 
 // notifySubs sends a given message to all corresponding subscribbers.
 // Only called from processLoop.
-func (p *PubSub) notifySubs(msg *pb.Message) {
-	for _, topic := range msg.GetTopicIDs() {
-		subs := p.myTopics[topic]
+func (p *PubSub) notifySubs(msg *message) {
+	for _, topic := range msg.topics {
+		subs := p.myTopics[string(topic.Bytes())]
 		for f := range subs {
-			f.ch <- &Message{msg}
+			f.ch <- msg.message
 		}
 	}
 }
@@ -257,30 +262,19 @@ func (p *PubSub) markSeen(id string) {
 	p.seenMessages.Add(id)
 }
 
-// subscribedToMessage returns whether we are subscribed to one of the topics
-// of a given message
-func (p *PubSub) subscribedToMsg(msg *pb.Message) bool {
-	for _, t := range msg.GetTopicIDs() {
-		if _, ok := p.myTopics[t]; ok {
-			return true
-		}
-	}
-	return false
-}
-
 func (p *PubSub) handleIncomingRPC(rpc *RPC) error {
 	for _, subopt := range rpc.GetSubscriptions() {
 		t := subopt.GetTopicid()
 		if subopt.GetSubscribe() {
-			tmap, ok := p.topics[t]
+			tmap, ok := p.topics[string(t)]
 			if !ok {
 				tmap = make(map[peer.ID]struct{})
-				p.topics[t] = tmap
+				p.topics[string(t)] = tmap
 			}
 
 			tmap[rpc.from] = struct{}{}
 		} else {
-			tmap, ok := p.topics[t]
+			tmap, ok := p.topics[string(t)]
 			if !ok {
 				continue
 			}
@@ -289,41 +283,88 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) error {
 	}
 
 	for _, pmsg := range rpc.GetPublish() {
-		if !p.subscribedToMsg(pmsg) {
-			log.Warning("received message we didn't subscribe to. Dropping.")
+		// Pull out the mcid first.
+		pmcid := pmsg.GetMessageCid()
+		mcid, err := cid.Cast(pmcid)
+		if err != nil {
+			log.Warning("Received message with an invalid CID. Dropping.")
 			continue
 		}
 
-		p.maybePublishMessage(rpc.from, pmsg)
+		ptopicIDs := pmsg.GetTopicIDs()
+		topicIDs := make([]*cid.Cid, 0, len(ptopicIDs))
+		for _, t := range ptopicIDs {
+			if _, ok := p.myTopics[string(t)]; !ok {
+				continue
+			}
+			c, err := cid.Cast(t)
+			if err != nil {
+				// We know this CID is valid because we're subscribed to it!
+				panic("we're subscribed to an invalid CID")
+			}
+			topicIDs = append(topicIDs, c)
+		}
+
+		if len(topicIDs) == 0 {
+			// Nothing to do.
+			log.Warning("Received message we didn't subscribe to. Dropping.")
+			continue
+		}
+		p.maybePublishMessage(rpc.from, &message{
+			topics:  topicIDs,
+			message: mcid,
+		})
 	}
 	return nil
 }
 
-// msgID returns a unique ID of the passed Message
-func msgID(pmsg *pb.Message) string {
-	return string(pmsg.GetFrom()) + string(pmsg.GetSeqno())
-}
+func (p *PubSub) maybePublishMessage(from peer.ID, msg *message) {
+	// Filter out topics on which we've already seen this message
+	filteredTopics := make([]*cid.Cid, 0, len(msg.topics))
+	messageBytes := msg.message.Bytes()
+	for _, topic := range msg.topics {
+		// Look ma! No separators!
+		// That's fine because CIDs are prefix-free.
+		id := string(append(topic.Bytes(), messageBytes...))
 
-func (p *PubSub) maybePublishMessage(from peer.ID, pmsg *pb.Message) {
-	id := msgID(pmsg)
-	if p.seenMessage(id) {
+		if p.seenMessage(id) {
+			continue
+		}
+		p.markSeen(id)
+		filteredTopics = append(filteredTopics, topic)
+	}
+	// Replace the existing TopicIDs with filtered ones.
+	// This is important because we can't *validate* this message against
+	// topics on which we are not subscribed. If we don't remove unknown
+	// topicIDs, a popular topic could be used as an amplification attack
+	// against nodes only subscribed to low-bandwidth topics.
+	msg.topics = filteredTopics
+
+	// We've seen it on all topics, abort publish.
+	if len(msg.topics) == 0 {
 		return
 	}
 
-	p.markSeen(id)
+	p.notifySubs(msg)
 
-	p.notifySubs(pmsg)
-
-	err := p.publishMessage(from, pmsg)
+	err := p.publishMessage(from, msg)
 	if err != nil {
 		log.Error("publish message: ", err)
 	}
 }
 
-func (p *PubSub) publishMessage(from peer.ID, msg *pb.Message) error {
+func (p *PubSub) publishMessage(from peer.ID, msg *message) error {
 	tosend := make(map[peer.ID]struct{})
-	for _, topic := range msg.GetTopicIDs() {
-		tmap, ok := p.topics[topic]
+	pmsg := &pb.Message{
+		MessageCid: msg.message.Bytes(),
+		TopicIDs:   make([][]byte, len(msg.topics)),
+	}
+	for i, topic := range msg.topics {
+		pmsg.TopicIDs[i] = topic.Bytes()
+
+	}
+	for _, topicId := range pmsg.TopicIDs {
+		tmap, ok := p.topics[string(topicId)]
 		if !ok {
 			continue
 		}
@@ -333,9 +374,9 @@ func (p *PubSub) publishMessage(from peer.ID, msg *pb.Message) error {
 		}
 	}
 
-	out := rpcWithMessages(msg)
+	out := rpcWithMessages(pmsg)
 	for pid := range tosend {
-		if pid == from || pid == peer.ID(msg.GetFrom()) {
+		if pid == from {
 			continue
 		}
 
@@ -351,30 +392,15 @@ func (p *PubSub) publishMessage(from peer.ID, msg *pb.Message) error {
 }
 
 type addSubReq struct {
-	topic string
+	topic *cid.Cid
 	resp  chan *Subscription
 }
 
 // Subscribe returns a new Subscription for the given topic
-func (p *PubSub) Subscribe(topic string) (*Subscription, error) {
-	td := pb.TopicDescriptor{Name: &topic}
-
-	return p.SubscribeByTopicDescriptor(&td)
-}
-
-// SubscribeByTopicDescriptor lets you subscribe a topic using a pb.TopicDescriptor
-func (p *PubSub) SubscribeByTopicDescriptor(td *pb.TopicDescriptor) (*Subscription, error) {
-	if td.GetAuth().GetMode() != pb.TopicDescriptor_AuthOpts_NONE {
-		return nil, fmt.Errorf("auth mode not yet supported")
-	}
-
-	if td.GetEnc().GetMode() != pb.TopicDescriptor_EncOpts_NONE {
-		return nil, fmt.Errorf("encryption mode not yet supported")
-	}
-
+func (p *PubSub) Subscribe(topic *cid.Cid) (*Subscription, error) {
 	out := make(chan *Subscription, 1)
 	p.addSub <- &addSubReq{
-		topic: td.GetName(),
+		topic: topic,
 		resp:  out,
 	}
 
@@ -382,28 +408,21 @@ func (p *PubSub) SubscribeByTopicDescriptor(td *pb.TopicDescriptor) (*Subscripti
 }
 
 type topicReq struct {
-	resp chan []string
+	resp chan []*cid.Cid
 }
 
 // GetTopics returns the topics this node is subscribed to
-func (p *PubSub) GetTopics() []string {
-	out := make(chan []string, 1)
+func (p *PubSub) GetTopics() []*cid.Cid {
+	out := make(chan []*cid.Cid, 1)
 	p.getTopics <- &topicReq{resp: out}
 	return <-out
 }
 
 // Publish publishes data under the given topic
-func (p *PubSub) Publish(topic string, data []byte) error {
-	seqno := make([]byte, 8)
-	binary.BigEndian.PutUint64(seqno, uint64(time.Now().UnixNano()))
-
-	p.publish <- &Message{
-		&pb.Message{
-			Data:     data,
-			TopicIDs: []string{topic},
-			From:     []byte(p.host.ID()),
-			Seqno:    seqno,
-		},
+func (p *PubSub) Publish(topic *cid.Cid, data *cid.Cid) error {
+	p.publish <- &message{
+		message: data,
+		topics:  []*cid.Cid{topic},
 	}
 	return nil
 }
@@ -414,11 +433,15 @@ type listPeerReq struct {
 }
 
 // ListPeers returns a list of peers we are connected to.
-func (p *PubSub) ListPeers(topic string) []peer.ID {
+func (p *PubSub) ListPeers(topic *cid.Cid) []peer.ID {
 	out := make(chan []peer.ID)
+	var tid string
+	if topic != nil {
+		tid = string(topic.Bytes())
+	}
 	p.getPeers <- &listPeerReq{
 		resp:  out,
-		topic: topic,
+		topic: tid,
 	}
 	return <-out
 }

@@ -1,7 +1,6 @@
 package floodsub
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -9,25 +8,38 @@ import (
 	"testing"
 	"time"
 
+	cid "github.com/ipfs/go-cid"
 	host "github.com/libp2p/go-libp2p-host"
 	netutil "github.com/libp2p/go-libp2p-netutil"
 	peer "github.com/libp2p/go-libp2p-peer"
+	mh "github.com/multiformats/go-multihash"
 	//bhost "github.com/libp2p/go-libp2p/p2p/host/basic"
 	bhost "github.com/libp2p/go-libp2p-blankhost"
 )
 
-func checkMessageRouting(t *testing.T, topic string, pubs []*PubSub, subs []*Subscription) {
-	data := make([]byte, 16)
-	rand.Read(data)
+func rawCid(data []byte) *cid.Cid {
+	cid, err := cid.NewPrefixV1(cid.Raw, mh.SHA2_256).Sum(data)
+	if err != nil {
+		panic("Couldn't make a raw SHA256 CID?")
+	}
+	return cid
+}
 
-	for _, p := range pubs {
-		err := p.Publish(topic, data)
+func rawCidS(data string) *cid.Cid {
+	return rawCid([]byte(data))
+}
+
+func checkMessageRouting(t *testing.T, topic *cid.Cid, pubs []*PubSub, subs []*Subscription) {
+
+	for i, p := range pubs {
+		msg := rawCidS(fmt.Sprintf("msg %d", i))
+		err := p.Publish(topic, msg)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		for _, s := range subs {
-			assertReceive(t, s, data)
+			assertReceive(t, s, msg)
 		}
 	}
 }
@@ -88,15 +100,15 @@ func getPubsubs(ctx context.Context, hs []host.Host) []*PubSub {
 	return psubs
 }
 
-func assertReceive(t *testing.T, ch *Subscription, exp []byte) {
+func assertReceive(t *testing.T, ch *Subscription, exp *cid.Cid) {
 	select {
 	case msg := <-ch.ch:
-		if !bytes.Equal(msg.GetData(), exp) {
-			t.Fatalf("got wrong message, expected %s but got %s", string(exp), string(msg.GetData()))
+		if !msg.Equals(exp) {
+			t.Fatalf("got wrong message, expected %s but got %s", exp.String(), msg.String())
 		}
 	case <-time.After(time.Second * 5):
 		t.Logf("%#v\n", ch)
-		t.Fatal("timed out waiting for message of: ", string(exp))
+		t.Fatal("timed out waiting for message of: ", exp.String())
 	}
 }
 
@@ -107,9 +119,11 @@ func TestBasicFloodsub(t *testing.T) {
 
 	psubs := getPubsubs(ctx, hosts)
 
+	topic := rawCidS("foobar")
+
 	var msgs []*Subscription
 	for _, ps := range psubs {
-		subch, err := ps.Subscribe("foobar")
+		subch, err := ps.Subscribe(topic)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -123,18 +137,18 @@ func TestBasicFloodsub(t *testing.T) {
 	time.Sleep(time.Millisecond * 100)
 
 	for i := 0; i < 100; i++ {
-		msg := []byte(fmt.Sprintf("%d the flooooooood %d", i, i))
+		msg := rawCidS(fmt.Sprintf("%d the flooooooood %d", i, i))
 
 		owner := rand.Intn(len(psubs))
 
-		psubs[owner].Publish("foobar", msg)
+		psubs[owner].Publish(topic, msg)
 
 		for _, sub := range msgs {
 			got, err := sub.Next(ctx)
 			if err != nil {
 				t.Fatal(sub.err)
 			}
-			if !bytes.Equal(msg, got.Data) {
+			if !msg.Equals(got) {
 				t.Fatal("got wrong message!")
 			}
 		}
@@ -147,6 +161,7 @@ func TestMultihops(t *testing.T) {
 	defer cancel()
 
 	hosts := getNetHosts(t, ctx, 6)
+	topic := rawCidS("foobar")
 
 	psubs := getPubsubs(ctx, hosts)
 
@@ -158,7 +173,7 @@ func TestMultihops(t *testing.T) {
 
 	var subs []*Subscription
 	for i := 1; i < 6; i++ {
-		ch, err := psubs[i].Subscribe("foobar")
+		ch, err := psubs[i].Subscribe(topic)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -167,8 +182,8 @@ func TestMultihops(t *testing.T) {
 
 	time.Sleep(time.Millisecond * 100)
 
-	msg := []byte("i like cats")
-	err := psubs[0].Publish("foobar", msg)
+	msg := rawCidS("i like cats")
+	err := psubs[0].Publish(topic, msg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +191,7 @@ func TestMultihops(t *testing.T) {
 	// last node in the chain should get the message
 	select {
 	case out := <-subs[4].ch:
-		if !bytes.Equal(out.GetData(), msg) {
+		if !out.Equals(msg) {
 			t.Fatal("got wrong data")
 		}
 	case <-time.After(time.Second * 5):
@@ -189,26 +204,27 @@ func TestReconnects(t *testing.T) {
 	defer cancel()
 
 	hosts := getNetHosts(t, ctx, 3)
+	topic := rawCidS("cats")
 
 	psubs := getPubsubs(ctx, hosts)
 
 	connect(t, hosts[0], hosts[1])
 	connect(t, hosts[0], hosts[2])
 
-	A, err := psubs[1].Subscribe("cats")
+	A, err := psubs[1].Subscribe(topic)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	B, err := psubs[2].Subscribe("cats")
+	B, err := psubs[2].Subscribe(topic)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(time.Millisecond * 100)
 
-	msg := []byte("apples and oranges")
-	err = psubs[0].Publish("cats", msg)
+	msg := rawCidS("apples and oranges")
+	err = psubs[0].Publish(topic, msg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,8 +236,8 @@ func TestReconnects(t *testing.T) {
 
 	time.Sleep(time.Millisecond * 50)
 
-	msg2 := []byte("potato")
-	err = psubs[0].Publish("cats", msg2)
+	msg2 := rawCidS("potato")
+	err = psubs[0].Publish(topic, msg2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,20 +252,20 @@ func TestReconnects(t *testing.T) {
 		t.Fatal("timed out waiting for B chan to be closed")
 	}
 
-	nSubs := len(psubs[2].myTopics["cats"])
+	nSubs := len(psubs[2].myTopics[string(topic.Bytes())])
 	if nSubs > 0 {
 		t.Fatal(`B should have 0 subscribers for channel "cats", has`, nSubs)
 	}
 
-	ch2, err := psubs[2].Subscribe("cats")
+	ch2, err := psubs[2].Subscribe(topic)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(time.Millisecond * 100)
 
-	nextmsg := []byte("ifps is kul")
-	err = psubs[0].Publish("cats", nextmsg)
+	nextmsg := rawCidS("ifps is kul")
+	err = psubs[0].Publish(topic, nextmsg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,15 +279,16 @@ func TestNoConnection(t *testing.T) {
 	defer cancel()
 
 	hosts := getNetHosts(t, ctx, 10)
+	topic := rawCidS("foobar")
 
 	psubs := getPubsubs(ctx, hosts)
 
-	ch, err := psubs[5].Subscribe("foobar")
+	ch, err := psubs[5].Subscribe(topic)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = psubs[0].Publish("foobar", []byte("TESTING"))
+	err = psubs[0].Publish(topic, rawCidS("TESTING"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,26 +304,27 @@ func TestSelfReceive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	topic := rawCidS("foobar")
 	host := getNetHosts(t, ctx, 1)[0]
 
 	psub := NewFloodSub(ctx, host)
 
-	msg := []byte("hello world")
+	msg := rawCidS("hello world")
 
-	err := psub.Publish("foobar", msg)
+	err := psub.Publish(topic, msg)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(time.Millisecond * 10)
 
-	ch, err := psub.Subscribe("foobar")
+	ch, err := psub.Subscribe(topic)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	msg2 := []byte("goodbye world")
-	err = psub.Publish("foobar", msg2)
+	msg2 := rawCidS("goodbye world")
+	err = psub.Publish(topic, msg2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,23 +336,24 @@ func TestOneToOne(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	topic := rawCidS("foobar")
 	hosts := getNetHosts(t, ctx, 2)
 	psubs := getPubsubs(ctx, hosts)
 
 	connect(t, hosts[0], hosts[1])
 
-	ch, err := psubs[1].Subscribe("foobar")
+	ch, err := psubs[1].Subscribe(topic)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(time.Millisecond * 50)
 
-	checkMessageRouting(t, "foobar", psubs, []*Subscription{ch})
+	checkMessageRouting(t, topic, psubs, []*Subscription{ch})
 }
 
 func assertPeerLists(t *testing.T, hosts []host.Host, ps *PubSub, has ...int) {
-	peers := ps.ListPeers("")
+	peers := ps.ListPeers(nil)
 	set := make(map[peer.ID]struct{})
 	for _, p := range peers {
 		set[p] = struct{}{}
@@ -351,6 +370,7 @@ func TestTreeTopology(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	topic := rawCidS("fizzbuzz")
 	hosts := getNetHosts(t, ctx, 10)
 	psubs := getPubsubs(ctx, hosts)
 
@@ -376,7 +396,7 @@ func TestTreeTopology(t *testing.T) {
 
 	var chs []*Subscription
 	for _, ps := range psubs {
-		ch, err := ps.Subscribe("fizzbuzz")
+		ch, err := ps.Subscribe(topic)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -390,20 +410,24 @@ func TestTreeTopology(t *testing.T) {
 	assertPeerLists(t, hosts, psubs[1], 0, 2, 4)
 	assertPeerLists(t, hosts, psubs[2], 1, 3)
 
-	checkMessageRouting(t, "fizzbuzz", []*PubSub{psubs[9], psubs[3]}, chs)
+	checkMessageRouting(t, topic, []*PubSub{psubs[9], psubs[3]}, chs)
 }
 
-func assertHasTopics(t *testing.T, ps *PubSub, exptopics ...string) {
+func assertHasTopics(t *testing.T, ps *PubSub, exptopics ...*cid.Cid) {
 	topics := ps.GetTopics()
-	sort.Strings(topics)
-	sort.Strings(exptopics)
+	sort.Slice(topics, func(i, j int) bool {
+		return string(topics[i].Bytes()) < string(topics[j].Bytes())
+	})
+	sort.Slice(exptopics, func(i, j int) bool {
+		return string(exptopics[i].Bytes()) < string(exptopics[j].Bytes())
+	})
 
 	if len(topics) != len(exptopics) {
 		t.Fatalf("expected to have %v, but got %v", exptopics, topics)
 	}
 
 	for i, v := range exptopics {
-		if topics[i] != v {
+		if !topics[i].Equals(v) {
 			t.Fatalf("expected %s but have %s", v, topics[i])
 		}
 	}
@@ -416,36 +440,41 @@ func TestSubReporting(t *testing.T) {
 	host := getNetHosts(t, ctx, 1)[0]
 	psub := NewFloodSub(ctx, host)
 
-	fooSub, err := psub.Subscribe("foo")
+	topicFoo := rawCidS("foo")
+	topicBar := rawCidS("bar")
+	topicBaz := rawCidS("baz")
+	topicFish := rawCidS("fish")
+
+	fooSub, err := psub.Subscribe(topicFoo)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	barSub, err := psub.Subscribe("bar")
+	barSub, err := psub.Subscribe(topicBar)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	assertHasTopics(t, psub, "foo", "bar")
+	assertHasTopics(t, psub, topicFoo, topicBar)
 
-	_, err = psub.Subscribe("baz")
+	_, err = psub.Subscribe(topicBaz)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	assertHasTopics(t, psub, "foo", "bar", "baz")
+	assertHasTopics(t, psub, topicFoo, topicBar, topicBaz)
 
 	barSub.Cancel()
-	assertHasTopics(t, psub, "foo", "baz")
+	assertHasTopics(t, psub, topicFoo, topicBaz)
 	fooSub.Cancel()
-	assertHasTopics(t, psub, "baz")
+	assertHasTopics(t, psub, topicBaz)
 
-	_, err = psub.Subscribe("fish")
+	_, err = psub.Subscribe(topicFish)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	assertHasTopics(t, psub, "baz", "fish")
+	assertHasTopics(t, psub, topicBaz, topicFish)
 }
 
 func TestPeerTopicReporting(t *testing.T) {
@@ -459,49 +488,49 @@ func TestPeerTopicReporting(t *testing.T) {
 	connect(t, hosts[0], hosts[2])
 	connect(t, hosts[0], hosts[3])
 
-	_, err := psubs[1].Subscribe("foo")
+	_, err := psubs[1].Subscribe(rawCidS("foo"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = psubs[1].Subscribe("bar")
+	_, err = psubs[1].Subscribe(rawCidS("bar"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = psubs[1].Subscribe("baz")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = psubs[2].Subscribe("foo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = psubs[2].Subscribe("ipfs")
+	_, err = psubs[1].Subscribe(rawCidS("baz"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = psubs[3].Subscribe("baz")
+	_, err = psubs[2].Subscribe(rawCidS("foo"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = psubs[3].Subscribe("ipfs")
+	_, err = psubs[2].Subscribe(rawCidS("ipfs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = psubs[3].Subscribe(rawCidS("baz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = psubs[3].Subscribe(rawCidS("ipfs"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(time.Millisecond * 10)
 
-	peers := psubs[0].ListPeers("ipfs")
+	peers := psubs[0].ListPeers(rawCidS("ipfs"))
 	assertPeerList(t, peers, hosts[2].ID(), hosts[3].ID())
 
-	peers = psubs[0].ListPeers("foo")
+	peers = psubs[0].ListPeers(rawCidS("foo"))
 	assertPeerList(t, peers, hosts[1].ID(), hosts[2].ID())
 
-	peers = psubs[0].ListPeers("baz")
+	peers = psubs[0].ListPeers(rawCidS("baz"))
 	assertPeerList(t, peers, hosts[1].ID(), hosts[3].ID())
 
-	peers = psubs[0].ListPeers("bar")
+	peers = psubs[0].ListPeers(rawCidS("bar"))
 	assertPeerList(t, peers, hosts[1].ID())
 }
 
@@ -511,14 +540,15 @@ func TestSubscribeMultipleTimes(t *testing.T) {
 
 	hosts := getNetHosts(t, ctx, 2)
 	psubs := getPubsubs(ctx, hosts)
+	topic := rawCidS("foo")
 
 	connect(t, hosts[0], hosts[1])
 
-	sub1, err := psubs[0].Subscribe("foo")
+	sub1, err := psubs[0].Subscribe(rawCidS("foo"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	sub2, err := psubs[0].Subscribe("foo")
+	sub2, err := psubs[0].Subscribe(rawCidS("foo"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,27 +556,24 @@ func TestSubscribeMultipleTimes(t *testing.T) {
 	// make sure subscribing is finished by the time we publish
 	time.Sleep(1 * time.Millisecond)
 
-	psubs[1].Publish("foo", []byte("bar"))
+	msg := rawCidS("bar")
+	psubs[1].Publish(topic, msg)
 
-	msg, err := sub1.Next(ctx)
+	out, err := sub1.Next(ctx)
 	if err != nil {
 		t.Fatalf("unexpected error: %v.", err)
 	}
 
-	data := string(msg.GetData())
-
-	if data != "bar" {
-		t.Fatalf("data is %s, expected %s.", data, "bar")
+	if !out.Equals(msg) {
+		t.Fatalf("data is %s, expected %s.", out.String(), msg.String())
 	}
 
-	msg, err = sub2.Next(ctx)
+	out, err = sub2.Next(ctx)
 	if err != nil {
 		t.Fatalf("unexpected error: %v.", err)
 	}
-	data = string(msg.GetData())
-
-	if data != "bar" {
-		t.Fatalf("data is %s, expected %s.", data, "bar")
+	if !out.Equals(msg) {
+		t.Fatalf("data is %s, expected %s.", out.String(), msg.String())
 	}
 }
 
