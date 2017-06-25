@@ -161,11 +161,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			}
 			preq.resp <- peers
 		case rpc := <-p.incoming:
-			err := p.handleIncomingRPC(rpc)
-			if err != nil {
-				log.Error("handling RPC: ", err)
-				continue
-			}
+			p.handleIncomingRPC(rpc)
 		case msg := <-p.publish:
 			p.maybePublishMessage(p.host.ID(), msg)
 		case <-ctx.Done():
@@ -262,7 +258,7 @@ func (p *PubSub) markSeen(id string) {
 	p.seenMessages.Add(id)
 }
 
-func (p *PubSub) handleIncomingRPC(rpc *RPC) error {
+func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 	for _, subopt := range rpc.GetSubscriptions() {
 		t := subopt.GetTopicid()
 		if subopt.GetSubscribe() {
@@ -315,7 +311,6 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) error {
 			message: mcid,
 		})
 	}
-	return nil
 }
 
 func (p *PubSub) maybePublishMessage(from peer.ID, msg *message) {
