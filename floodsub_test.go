@@ -9,6 +9,9 @@ import (
 	"time"
 
 	cid "github.com/ipfs/go-cid"
+	cbornode "github.com/ipfs/go-ipld-cbor"
+	nodes "github.com/ipfs/go-ipld-format"
+	logging "github.com/ipfs/go-log"
 	host "github.com/libp2p/go-libp2p-host"
 	netutil "github.com/libp2p/go-libp2p-netutil"
 	peer "github.com/libp2p/go-libp2p-peer"
@@ -16,6 +19,10 @@ import (
 	//bhost "github.com/libp2p/go-libp2p/p2p/host/basic"
 	bhost "github.com/libp2p/go-libp2p-blankhost"
 )
+
+func init() {
+	nodes.Register(cid.DagCBOR, cbornode.DecodeBlock)
+}
 
 func stringCid(data string) *cid.Cid {
 	cid, err := cid.NewPrefixV1(cid.Raw, mh.ID).Sum([]byte(data))
@@ -38,18 +45,6 @@ func checkMessageRouting(t *testing.T, topic *cid.Cid, pubs []*PubSub, subs []*S
 			assertReceive(t, s, msg)
 		}
 	}
-}
-
-func getNetHosts(t *testing.T, ctx context.Context, n int) []host.Host {
-	var out []host.Host
-
-	for i := 0; i < n; i++ {
-		netw := netutil.GenSwarmNetwork(t, ctx)
-		h := bhost.NewBlankHost(netw)
-		out = append(out, h)
-	}
-
-	return out
 }
 
 func connect(t *testing.T, a, b host.Host) {
@@ -88,12 +83,18 @@ func connectAll(t *testing.T, hosts []host.Host) {
 	}
 }
 
-func getPubsubs(ctx context.Context, hs []host.Host) []*PubSub {
-	var psubs []*PubSub
-	for _, h := range hs {
-		psubs = append(psubs, NewFloodSub(ctx, h))
+func getTestNodes(t *testing.T, ctx context.Context, n int) ([]host.Host, []*basicDAG, []*PubSub) {
+	hosts := make([]host.Host, n)
+	dags := make([]*basicDAG, n)
+	pubsubs := make([]*PubSub, n)
+
+	for i := 0; i < n; i++ {
+		netw := netutil.GenSwarmNetwork(t, ctx)
+		hosts[i] = bhost.NewBlankHost(netw)
+		dags[i] = newBasicDAG()
+		pubsubs[i] = NewFloodSub(ctx, hosts[i], dags[i])
 	}
-	return psubs
+	return hosts, dags, pubsubs
 }
 
 func assertReceive(t *testing.T, ch *Subscription, exp *cid.Cid) {
@@ -111,9 +112,7 @@ func assertReceive(t *testing.T, ch *Subscription, exp *cid.Cid) {
 func TestBasicFloodsub(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	hosts := getNetHosts(t, ctx, 20)
-
-	psubs := getPubsubs(ctx, hosts)
+	hosts, _, psubs := getTestNodes(t, ctx, 20)
 
 	topic := stringCid("foobar")
 
@@ -156,10 +155,8 @@ func TestMultihops(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 6)
+	hosts, _, psubs := getTestNodes(t, ctx, 6)
 	topic := stringCid("foobar")
-
-	psubs := getPubsubs(ctx, hosts)
 
 	connect(t, hosts[0], hosts[1])
 	connect(t, hosts[1], hosts[2])
@@ -199,10 +196,8 @@ func TestReconnects(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 3)
+	hosts, _, psubs := getTestNodes(t, ctx, 3)
 	topic := stringCid("cats")
-
-	psubs := getPubsubs(ctx, hosts)
 
 	connect(t, hosts[0], hosts[1])
 	connect(t, hosts[0], hosts[2])
@@ -274,10 +269,8 @@ func TestNoConnection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 10)
+	_, _, psubs := getTestNodes(t, ctx, 10)
 	topic := stringCid("foobar")
-
-	psubs := getPubsubs(ctx, hosts)
 
 	ch, err := psubs[5].Subscribe(topic)
 	if err != nil {
@@ -300,10 +293,10 @@ func TestSelfReceive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	topic := stringCid("foobar")
-	host := getNetHosts(t, ctx, 1)[0]
+	_, _, psubs := getTestNodes(t, ctx, 1)
+	psub := psubs[0]
 
-	psub := NewFloodSub(ctx, host)
+	topic := stringCid("foobar")
 
 	msg := stringCid("hello world")
 
@@ -333,8 +326,7 @@ func TestOneToOne(t *testing.T) {
 	defer cancel()
 
 	topic := stringCid("foobar")
-	hosts := getNetHosts(t, ctx, 2)
-	psubs := getPubsubs(ctx, hosts)
+	hosts, _, psubs := getTestNodes(t, ctx, 2)
 
 	connect(t, hosts[0], hosts[1])
 
@@ -367,8 +359,7 @@ func TestTreeTopology(t *testing.T) {
 	defer cancel()
 
 	topic := stringCid("fizzbuzz")
-	hosts := getNetHosts(t, ctx, 10)
-	psubs := getPubsubs(ctx, hosts)
+	hosts, _, psubs := getTestNodes(t, ctx, 10)
 
 	connect(t, hosts[0], hosts[1])
 	connect(t, hosts[1], hosts[2])
@@ -433,8 +424,8 @@ func TestSubReporting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	host := getNetHosts(t, ctx, 1)[0]
-	psub := NewFloodSub(ctx, host)
+	_, _, psubs := getTestNodes(t, ctx, 1)
+	psub := psubs[0]
 
 	topicFoo := stringCid("foo")
 	topicBar := stringCid("bar")
@@ -477,8 +468,7 @@ func TestPeerTopicReporting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 4)
-	psubs := getPubsubs(ctx, hosts)
+	hosts, _, psubs := getTestNodes(t, ctx, 4)
 
 	connect(t, hosts[0], hosts[1])
 	connect(t, hosts[0], hosts[2])
@@ -534,8 +524,7 @@ func TestSubscribeMultipleTimes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hosts := getNetHosts(t, ctx, 2)
-	psubs := getPubsubs(ctx, hosts)
+	hosts, _, psubs := getTestNodes(t, ctx, 2)
 	topic := stringCid("foo")
 
 	connect(t, hosts[0], hosts[1])
@@ -575,7 +564,6 @@ func TestSubscribeMultipleTimes(t *testing.T) {
 
 func pretty(c *cid.Cid) string {
 	decoded, _ := mh.Decode([]byte(c.Hash()))
-	fmt.Printf("here %v\n", decoded.Code)
 	if decoded.Code == mh.ID {
 		// TODO: Check if type is utf8 string?
 		return fmt.Sprintf("i/%s", decoded.Digest)
@@ -594,6 +582,77 @@ func assertPeerList(t *testing.T, peers []peer.ID, expected ...peer.ID) {
 	for i, p := range peers {
 		if expected[i] != p {
 			t.Fatalf("mismatch: %s != %s", peers, expected)
+		}
+	}
+}
+
+func TestGossip(t *testing.T) {
+	logging.LevelInfo()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hosts, dags, psubs := getTestNodes(t, ctx, 2)
+	topic := stringCid("foo")
+
+	connect(t, hosts[0], hosts[1])
+
+	sub1, err := psubs[0].Subscribe(stringCid("foo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub2, err := psubs[1].Subscribe(stringCid("foo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// make sure subscribing is finished by the time we publish
+	time.Sleep(1 * time.Millisecond)
+
+	extra, _ := cbornode.WrapObject("unused")
+	child, _ := cbornode.WrapObject("left")
+	left, _ := cbornode.WrapObject(map[string]interface{}{"child": child.Cid()})
+	right, _ := cbornode.WrapObject("right")
+
+	msg, _ := cbornode.WrapObject(map[string]interface{}{
+		"left":  left.Cid(),
+		"right": right.Cid(),
+	})
+
+	psubs[0].Publish(topic, msg.Cid(), msg, left, right, extra, child)
+
+	out, err := sub1.Next(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v.", err)
+	}
+
+	if !out.Equals(msg.Cid()) {
+		t.Fatalf("data is %s, expected %s.", pretty(out), pretty(msg.Cid()))
+	}
+
+	out, err = sub2.Next(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v.", err)
+	}
+	if !out.Equals(msg.Cid()) {
+		t.Fatalf("data is %s, expected %s.", pretty(out), pretty(msg.Cid()))
+	}
+
+	for i, who := range []string{"our own", "our peer's"} {
+		if _, err = dags[i].Get(ctx, msg.Cid()); err != nil {
+			t.Fatalf("failed to retrieve msg node from %s dag: %s", who, err)
+		}
+		if _, err = dags[i].Get(ctx, left.Cid()); err != nil {
+			t.Fatalf("failed to retrieve left node from %s dag: %s", who, err)
+		}
+		if _, err = dags[i].Get(ctx, right.Cid()); err != nil {
+			t.Fatalf("failed to retrieve right node from %s dag: %s", who, err)
+		}
+		if _, err = dags[i].Get(ctx, child.Cid()); err != nil {
+			t.Fatalf("failed to retrieve child node from %s dag: %s", who, err)
+		}
+		if _, err = dags[i].Get(ctx, extra.Cid()); err == nil {
+			t.Fatalf("successfully retrieved extra node from %s dag: %s", who, err)
 		}
 	}
 }

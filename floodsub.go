@@ -7,7 +7,9 @@ import (
 
 	pb "github.com/libp2p/go-floodsub/pb"
 
+	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
+	nodes "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log"
 	host "github.com/libp2p/go-libp2p-host"
 	inet "github.com/libp2p/go-libp2p-net"
@@ -27,7 +29,7 @@ type PubSub struct {
 	incoming chan *RPC
 
 	// messages we are publishing out to our peers
-	publish chan *message
+	publish chan *pubMessageReq
 
 	// control channel for adding new subscriptions
 	addSub chan *addSubReq
@@ -57,6 +59,12 @@ type PubSub struct {
 	peers        map[peer.ID]chan *RPC
 	seenMessages *timecache.TimeCache
 
+	// DAG of gossiped blocks.
+	gossip *associatedDAG
+
+	// The system's DAG.
+	dag nodes.DAGService
+
 	ctx context.Context
 }
 
@@ -73,12 +81,13 @@ type RPC struct {
 }
 
 // NewFloodSub returns a new FloodSub management object
-func NewFloodSub(ctx context.Context, h host.Host) *PubSub {
+func NewFloodSub(ctx context.Context, h host.Host, d nodes.DAGService) *PubSub {
 	ps := &PubSub{
 		host:         h,
+		dag:          d,
 		ctx:          ctx,
 		incoming:     make(chan *RPC, 32),
-		publish:      make(chan *message),
+		publish:      make(chan *pubMessageReq),
 		newPeers:     make(chan inet.Stream),
 		peerDead:     make(chan peer.ID),
 		cancelCh:     make(chan *Subscription),
@@ -89,6 +98,7 @@ func NewFloodSub(ctx context.Context, h host.Host) *PubSub {
 		topics:       make(map[string]map[peer.ID]struct{}),
 		peers:        make(map[peer.ID]chan *RPC),
 		seenMessages: timecache.NewTimeCache(time.Second * 30),
+		gossip:       newAssociatedDAG(),
 	}
 
 	h.SetStreamHandler(ID, ps.handleNewStream)
@@ -162,8 +172,8 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			preq.resp <- peers
 		case rpc := <-p.incoming:
 			p.handleIncomingRPC(rpc)
-		case msg := <-p.publish:
-			p.maybePublishMessage(p.host.ID(), msg)
+		case req := <-p.publish:
+			p.maybePublishMessage(p.host.ID(), req.message, req.gossip)
 		case <-ctx.Done():
 			log.Info("pubsub processloop shutting down")
 			return
@@ -259,7 +269,40 @@ func (p *PubSub) markSeen(id string) {
 }
 
 func (p *PubSub) handleIncomingRPC(rpc *RPC) {
-	for _, subopt := range rpc.GetSubscriptions() {
+	p.handleIncomingSubscriptions(rpc.from, rpc.GetSubscriptions())
+
+	messages := p.parseIncomingMessages(rpc.from, rpc.GetPublish())
+	if len(messages) == 0 {
+		// We don't care about anything in this message set.
+		// Don't even bother parsing the gossip.
+		// In the future, we *may* decide we care about the gossip and
+		// decide to pilfer it for stuff we want.
+		return
+	}
+
+	gossip := parseBlocks(rpc.GetGossip())
+
+	for _, msg := range messages {
+		p.maybePublishMessage(rpc.from, msg, gossip)
+	}
+}
+
+func parseBlocks(pblocks []*pb.Block) []blocks.Block {
+	gossip := make([]blocks.Block, 0, len(pblocks))
+	for _, pblock := range pblocks {
+		block, err := decodeBlock(pblock)
+		if err != nil {
+			// Already logged it.
+			continue
+		}
+		gossip = append(gossip, block)
+	}
+
+	return gossip
+}
+
+func (p *PubSub) handleIncomingSubscriptions(from peer.ID, subopts []*pb.RPC_SubOpts) {
+	for _, subopt := range subopts {
 		t := subopt.GetTopicid()
 		if subopt.GetSubscribe() {
 			tmap, ok := p.topics[string(t)]
@@ -268,25 +311,20 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 				p.topics[string(t)] = tmap
 			}
 
-			tmap[rpc.from] = struct{}{}
+			tmap[from] = struct{}{}
 		} else {
 			tmap, ok := p.topics[string(t)]
 			if !ok {
 				continue
 			}
-			delete(tmap, rpc.from)
+			delete(tmap, from)
 		}
 	}
+}
 
-	for _, pmsg := range rpc.GetPublish() {
-		// Pull out the mcid first.
-		pmcid := pmsg.GetMessageCid()
-		mcid, err := cid.Cast(pmcid)
-		if err != nil {
-			log.Warning("Received message with an invalid CID. Dropping.")
-			continue
-		}
-
+func (p *PubSub) parseIncomingMessages(from peer.ID, pmessages []*pb.Message) []*message {
+	messages := make([]*message, 0, len(pmessages))
+	for _, pmsg := range pmessages {
 		ptopicIDs := pmsg.GetTopicIDs()
 		topicIDs := make([]*cid.Cid, 0, len(ptopicIDs))
 		for _, t := range ptopicIDs {
@@ -306,26 +344,44 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 			log.Warning("Received message we didn't subscribe to. Dropping.")
 			continue
 		}
-		p.maybePublishMessage(rpc.from, &message{
+
+		mcid, err := cid.Cast(pmsg.GetMessageCid())
+		if err != nil {
+			log.Warning("Received message with an invalid CID. Dropping.")
+			continue
+		}
+
+		messages = append(messages, &message{
 			topics:  topicIDs,
 			message: mcid,
 		})
 	}
+	return messages
 }
 
-func (p *PubSub) maybePublishMessage(from peer.ID, msg *message) {
+func msgID(topic *cid.Cid, msg *cid.Cid) string {
+	// Look ma! No separators!
+	// That's fine because CIDs are prefix-free.
+	topicBytes := topic.Bytes()
+	msgBytes := msg.Bytes()
+	id := make([]byte, len(topicBytes)+len(msgBytes))
+	id = append(id, topicBytes...)
+	id = append(id, msgBytes...)
+	return string(id)
+}
+
+func (p *PubSub) maybePublishMessage(from peer.ID, msg *message, gossip []blocks.Block) {
 	// Filter out topics on which we've already seen this message
 	filteredTopics := make([]*cid.Cid, 0, len(msg.topics))
-	messageBytes := msg.message.Bytes()
 	for _, topic := range msg.topics {
-		// Look ma! No separators!
-		// That's fine because CIDs are prefix-free.
-		id := string(append(topic.Bytes(), messageBytes...))
+		id := msgID(topic, msg.message)
 
+		// Check if we have already processed it.
 		if p.seenMessage(id) {
 			continue
 		}
 		p.markSeen(id)
+
 		filteredTopics = append(filteredTopics, topic)
 	}
 	// Replace the existing TopicIDs with filtered ones.
@@ -340,15 +396,62 @@ func (p *PubSub) maybePublishMessage(from peer.ID, msg *message) {
 		return
 	}
 
-	p.notifySubs(msg)
+	p.gossip.AddAssociatedDAG(msg.message, gossip)
 
-	err := p.publishMessage(from, msg)
+	// TODO: validate here.
+	// NOTE: validation will change how this works significantly as we're
+	// going to need to do it asynchronously. However, I'm going to leave
+	// that for a future commit.
+
+	p.publishMessage(from, msg)
+}
+
+func decodeBlock(pblock *pb.Block) (blocks.Block, error) {
+	prefix, err := cid.PrefixFromBytes(pblock.GetPrefix())
 	if err != nil {
-		log.Error("publish message: ", err)
+		log.Warning("Received block with invalid CID prefix: ", err)
+		return nil, err
+	}
+	c, err := prefix.Sum(pblock.GetData())
+	if err != nil {
+		log.Info("Failed to generate CID for block: ", err)
+		return nil, err
+	}
+
+	block, err := blocks.NewBlockWithCid(pblock.GetData(), c)
+	if err != nil {
+		log.Error("The CID we *just* generated failed to match the block: ", err)
+		return nil, err
+	}
+	return block, nil
+}
+
+func encodeBlock(block blocks.Block) *pb.Block {
+	return &pb.Block{
+		Prefix: block.Cid().Prefix().Bytes(),
+		Data:   block.RawData(),
 	}
 }
 
-func (p *PubSub) publishMessage(from peer.ID, msg *message) error {
+func (p *PubSub) publishMessage(from peer.ID, msg *message) {
+	gossipCids := p.gossip.GetAssociatedDAG(msg.message)
+	gossip := make([]*pb.Block, len(gossipCids))
+	for i, c := range gossipCids {
+		node, err := p.gossip.Get(c)
+		if err != nil {
+			panic("that shouldn't happen...")
+		}
+		if _, err = p.dag.Add(node); err != nil {
+			log.Infof("failed to put gossiped node %s in dag: %s", c, err)
+		}
+		gossip[i] = &pb.Block{
+			Prefix: c.Prefix().Bytes(),
+			Data:   node.RawData(),
+		}
+	}
+	p.gossip.RemoveAssociatedDAG(msg.message)
+	p.notifySubs(msg)
+
 	tosend := make(map[peer.ID]struct{})
 	pmsg := &pb.Message{
 		MessageCid: msg.message.Bytes(),
@@ -370,6 +473,8 @@ func (p *PubSub) publishMessage(from peer.ID, msg *message) error {
 	}
 
 	out := rpcWithMessages(pmsg)
+	out.Gossip = gossip
+
 	for pid := range tosend {
 		if pid == from {
 			continue
@@ -382,8 +487,6 @@ func (p *PubSub) publishMessage(from peer.ID, msg *message) error {
 
 		go func() { mch <- out }()
 	}
-
-	return nil
 }
 
 type addSubReq struct {
@@ -413,11 +516,19 @@ func (p *PubSub) GetTopics() []*cid.Cid {
 	return <-out
 }
 
+type pubMessageReq struct {
+	message *message
+	gossip  []blocks.Block
+}
+
 // Publish publishes data under the given topic
-func (p *PubSub) Publish(topic *cid.Cid, data *cid.Cid) error {
-	p.publish <- &message{
-		message: data,
-		topics:  []*cid.Cid{topic},
+func (p *PubSub) Publish(topic *cid.Cid, msg *cid.Cid, data ...blocks.Block) error {
+	p.publish <- &pubMessageReq{
+		message: &message{
+			message: msg,
+			topics:  []*cid.Cid{topic},
+		},
+		gossip: data,
 	}
 	return nil
 }

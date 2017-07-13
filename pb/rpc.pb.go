@@ -11,6 +11,7 @@ It is generated from these files:
 It has these top-level messages:
 	RPC
 	Message
+	Block
 */
 package floodsub_pb
 
@@ -24,9 +25,14 @@ var _ = fmt.Errorf
 var _ = math.Inf
 
 type RPC struct {
-	Subscriptions    []*RPC_SubOpts `protobuf:"bytes,1,rep,name=subscriptions" json:"subscriptions,omitempty"`
-	Publish          []*Message     `protobuf:"bytes,2,rep,name=publish" json:"publish,omitempty"`
-	XXX_unrecognized []byte         `json:"-"`
+	Subscriptions []*RPC_SubOpts `protobuf:"bytes,1,rep,name=subscriptions" json:"subscriptions,omitempty"`
+	Publish       []*Message     `protobuf:"bytes,2,rep,name=publish" json:"publish,omitempty"`
+	// The core protocol deals in CIDs.
+	// That's cheap!
+	// Let's cheat.
+	// Gossip what we need!
+	Gossip           []*Block `protobuf:"bytes,3,rep,name=gossip" json:"gossip,omitempty"`
+	XXX_unrecognized []byte   `json:"-"`
 }
 
 func (m *RPC) Reset()         { *m = RPC{} }
@@ -43,6 +49,13 @@ func (m *RPC) GetSubscriptions() []*RPC_SubOpts {
 func (m *RPC) GetPublish() []*Message {
 	if m != nil {
 		return m.Publish
+	}
+	return nil
+}
+
+func (m *RPC) GetGossip() []*Block {
+	if m != nil {
+		return m.Gossip
 	}
 	return nil
 }
@@ -95,8 +108,34 @@ func (m *Message) GetTopicIDs() [][]byte {
 	return nil
 }
 
+// TODO: use the shared Block definition from bitswap.
+type Block struct {
+	Prefix           []byte `protobuf:"bytes,1,opt,name=prefix" json:"prefix,omitempty"`
+	Data             []byte `protobuf:"bytes,2,opt,name=data" json:"data,omitempty"`
+	XXX_unrecognized []byte `json:"-"`
+}
+
+func (m *Block) Reset()         { *m = Block{} }
+func (m *Block) String() string { return proto.CompactTextString(m) }
+func (*Block) ProtoMessage()    {}
+
+func (m *Block) GetPrefix() []byte {
+	if m != nil {
+		return m.Prefix
+	}
+	return nil
+}
+
+func (m *Block) GetData() []byte {
+	if m != nil {
+		return m.Data
+	}
+	return nil
+}
+
 func init() {
 	proto.RegisterType((*RPC)(nil), "floodsub.pb.RPC")
 	proto.RegisterType((*RPC_SubOpts)(nil), "floodsub.pb.RPC.SubOpts")
 	proto.RegisterType((*Message)(nil), "floodsub.pb.Message")
+	proto.RegisterType((*Block)(nil), "floodsub.pb.Block")
 }

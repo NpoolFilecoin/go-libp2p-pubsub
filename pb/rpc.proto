@@ -6,6 +6,12 @@ message RPC {
 	repeated SubOpts subscriptions = 1;
 	repeated Message publish = 2;
 
+	// The core protocol deals in CIDs.
+	// That's cheap!
+	// Let's cheat.
+	// Gossip what we need!
+	repeated Block   gossip = 3;
+
 	message SubOpts {
 		optional bool subscribe = 1; // subscribe or unsubcribe
 		optional bytes topicid = 2;
@@ -15,4 +21,10 @@ message RPC {
 message Message {
 	optional bytes messageCid = 1;
 	repeated bytes topicIDs = 2;
+}
+
+// TODO: use the shared Block definition from bitswap.
+message Block {
+	optional bytes prefix = 1;
+	optional bytes data = 2;
 }
