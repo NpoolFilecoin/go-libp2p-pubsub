@@ -1,0 +1,6 @@
+runs:
+  using: "composite"
+  steps:
+    - name: Step 1 
+      shell: bash
+      run: ulimit -n 4096
