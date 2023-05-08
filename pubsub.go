@@ -742,7 +742,7 @@ func (p *PubSub) handleDeadPeers() {
 		} else {
 			go func() {
 				time.Sleep(1 * time.Minute)
-				log.Infof("connect removed peer %v again", pid)
+				log.Infof("connect removed peer %v again, peers %v", pid, len(p.peers))
 				p.rt.DirectConnectPeer(pid)
 			}()
 		}
