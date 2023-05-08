@@ -49,6 +49,10 @@ func (fs *FloodSubRouter) RemovePeer(p peer.ID) {
 	fs.tracer.RemovePeer(p)
 }
 
+func (fs *FloodSubRouter) DirectConnectPeer(p peer.ID) {
+	return
+}
+
 func (fs *FloodSubRouter) EnoughPeers(topic string, suggested int) bool {
 	// check all peers in the topic
 	tmap, ok := fs.p.topics[topic]
