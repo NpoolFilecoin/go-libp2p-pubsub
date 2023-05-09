@@ -208,7 +208,8 @@ type PubSubRouter interface {
 	// Leave notifies the router that we are no longer interested in a topic.
 	// It is invoked after the unsubscription announcement.
 	Leave(topic string)
-	DirectConnectPeer(p peer.ID)
+	ConnectPeer(p peer.ID)
+	PeerScore(p peer.ID) float64
 }
 
 type AcceptStatus int
@@ -742,8 +743,8 @@ func (p *PubSub) handleDeadPeers() {
 		} else {
 			go func() {
 				time.Sleep(1 * time.Minute)
-				log.Infof("connect removed peer %v again, peers %v", pid, len(p.peers))
-				p.rt.DirectConnectPeer(pid)
+				log.Infof("connect removed peer %v, score %v again, peers %v", pid, p.rt.PeerScore(pid), len(p.peers))
+				p.rt.ConnectPeer(pid)
 			}()
 		}
 	}

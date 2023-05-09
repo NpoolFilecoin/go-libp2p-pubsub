@@ -1645,10 +1645,14 @@ func (gs *GossipSubRouter) clearBackoff() {
 	}
 }
 
-func (gs *GossipSubRouter) DirectConnectPeer(p peer.ID) {
+func (gs *GossipSubRouter) ConnectPeer(p peer.ID) {
 	go func() {
 		gs.connect <- connectInfo{p: p}
 	}()
+}
+
+func (gs *GossipSubRouter) PeerScore(p peer.ID) float64 {
+	return gs.score.Score(p)
 }
 
 func (gs *GossipSubRouter) directConnect() {
