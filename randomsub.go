@@ -55,6 +55,14 @@ func (rs *RandomSubRouter) RemovePeer(p peer.ID) {
 	delete(rs.peers, p)
 }
 
+func (rs *RandomSubRouter) ConnectPeer(p peer.ID) {
+	return
+}
+
+func (fs *RandomSubRouter) PeerScore(p peer.ID) float64 {
+	return 0.0
+}
+
 func (rs *RandomSubRouter) EnoughPeers(topic string, suggested int) bool {
 	// check all peers in the topic
 	tmap, ok := rs.p.topics[topic]
